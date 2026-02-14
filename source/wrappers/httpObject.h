@@ -52,19 +52,52 @@
 #include "app/net/tcpObject.h"
 #endif
 
+#ifndef RAPIDJSON_DOCUMENT_H_
+#include "persistence/rapidjson/document.h"
+#endif
+
+
+#ifndef TINYXML2_INCLUDED
+#include <tinyxml2.h>
+#endif
+
 #include <curl/curl.h>
 #include <string>
 #include <unordered_map>
+
+struct HttpValue
+{
+   enum class Type
+   {
+      Null,
+      Bool,
+      Number,
+      String,
+      Object,
+      Array
+   };
+
+   Type type = Type::Null;
+
+   bool boolValue = false;
+   double numberValue = 0.0;
+   std::string stringValue;
+
+   std::unordered_map<std::string, HttpValue> objectValues;
+   std::vector<HttpValue> arrayValues;
+};
 
 class HTTPObject : public SimObject
 {
 private:
    typedef SimObject Parent;
 protected:
+   HttpValue mRootValue;
    CURL *mCurl;
    U8 *mBuffer;
    U32 mBufferSize;
    U32 mBufferUsed;
+   bool mHasParsedValue;
 
    std::string mUrl;
    std::string mValues;
@@ -97,6 +130,20 @@ protected:
    void onDownloadFailed(const std::string& path);
    void onDisconnect();
 
+   void parseResponseBody();
+
+   // PARSE JSON RESPONSE
+   void parseJsonBody();
+   HttpValue convertJsonValue(const rapidjson::Value& v);
+   // END PARSE JSON RESPONSE
+
+    // PARSE XML RESPONSE
+   void parseXmlBody();
+   HttpValue convertXmlElement(const tinyxml2::XMLElement* elem);
+   // END PARSE XML RESPONSE
+
+   const HttpValue* resolvePath(const std::string& path) const;
+
 public:
    HTTPObject();
    ~HTTPObject() override;
@@ -111,6 +158,12 @@ public:
    static void init();
    static void process();
    static void shutdown();
+
+   bool HTTPObject::hasValue(const std::string& path) const;
+   std::string HTTPObject::getString(const std::string& path) const;
+   double HTTPObject::getNumber(const std::string& path) const;
+   bool HTTPObject::getBool(const std::string& path) const;
+   S32 HTTPObject::getArraySize(const std::string& path) const;
 
    DECLARE_CONOBJECT(HTTPObject);
 };
