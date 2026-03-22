@@ -155,13 +155,14 @@ HTTPObject::HTTPObject()
    mBufferSize(0),
    mBufferUsed(0),
    mDownload(false),
-   mHeaders(nullptr)
+   mHeaders(nullptr),
+   mHasParsedValue(false)
 {
    CURL *request = curl_easy_init();
    curl_easy_setopt(request, CURLOPT_VERBOSE, false);
    curl_easy_setopt(request, CURLOPT_FOLLOWLOCATION, true);
    curl_easy_setopt(request, CURLOPT_TRANSFERTEXT, true);
-   curl_easy_setopt(request, CURLOPT_USERAGENT, "Torque 1.0");
+   curl_easy_setopt(request, CURLOPT_USERAGENT, TORQUE_APP_NAME);
    curl_easy_setopt(request, CURLOPT_ENCODING, "ISO 8859-1");
 
    mCurl = request;
@@ -234,6 +235,11 @@ size_t HTTPObject::processHeader(char *buffer, size_t size, size_t nitems)
 
 void HTTPObject::start()
 {
+   if (mHeaders != nullptr)
+   {
+      curl_easy_setopt(mCurl, CURLOPT_HTTPHEADER, mHeaders);
+   }
+
    CURLMcode result = curl_multi_add_handle(gCurlMulti, mCurl);
    if (result != CURLM_OK) {
       Con::errorf("curl_easy_perform failed (%d): %s", result, curl_multi_strerror(result));
@@ -333,7 +339,8 @@ void HTTPObject::finish(CURLcode errorCode)
 
    if (status) {
       //We're done
-      processLines();
+      parseResponseBody(); // build httpvalue tree for xml and json
+      processLines();      // process lines for string and form (normal behaviou)
    } else {
       Con::errorf("Error info: Code %d: %s", errorCode, curl_easy_strerror(errorCode));
    }
@@ -549,4 +556,310 @@ DefineEngineMethod(HTTPObject, setDownloadPath, void, (const char* path),, "HTTP
 DefineEngineMethod(HTTPObject, addHeader, void, (const char* name, const char* value),, "HTTPObject.addHeader(name, value)")
 {
    object->addHeader(name, value);
+}
+
+void HTTPObject::parseResponseBody()
+{
+   auto it = mRecieveHeaders.find("Content-Type");
+   if (it == mRecieveHeaders.end())
+      return;
+
+   const std::string& contentType = it->second;
+
+   std::string mimeType = contentType;
+   std::string charset;
+
+   size_t semi = contentType.find(';');
+   if (semi != std::string::npos)
+   {
+      mimeType = contentType.substr(0, semi);
+
+      size_t cs = contentType.find("charset=", semi);
+      if (cs != std::string::npos)
+         charset = contentType.substr(cs + 8);
+   }
+
+   if (mimeType.find("application/json") != std::string::npos)
+      parseJsonBody();
+   else if (mimeType.find("xml") != std::string::npos)
+      parseXmlBody();
+}
+
+// PARSE JSON RESPONSE
+
+void HTTPObject::parseJsonBody()
+{
+   rapidjson::Document doc;
+   doc.Parse((const char*)mBuffer);
+
+   if (doc.HasParseError())
+   {
+      Con::errorf("HTTPObject JSON parse error at offset %u",
+         (U32)doc.GetErrorOffset());
+      return;
+   }
+
+   mRootValue = convertJsonValue(doc);
+   mHasParsedValue = true;
+}
+
+HttpValue HTTPObject::convertJsonValue(const rapidjson::Value& v)
+{
+   HttpValue out;
+
+   if (v.IsNull())
+      out.type = HttpValue::Type::Null;
+   else if (v.IsBool())
+   {
+      out.type = HttpValue::Type::Bool;
+      out.boolValue = v.GetBool();
+   }
+   else if (v.IsNumber())
+   {
+      out.type = HttpValue::Type::Number;
+      out.numberValue = v.GetDouble();
+   }
+   else if (v.IsString())
+   {
+      out.type = HttpValue::Type::String;
+      out.stringValue = v.GetString();
+   }
+   else if (v.IsArray())
+   {
+      out.type = HttpValue::Type::Array;
+      for (const auto& e : v.GetArray())
+         out.arrayValues.push_back(convertJsonValue(e));
+   }
+   else if (v.IsObject())
+   {
+      out.type = HttpValue::Type::Object;
+      for (auto it = v.MemberBegin(); it != v.MemberEnd(); ++it)
+         out.objectValues[it->name.GetString()] =
+         convertJsonValue(it->value);
+   }
+
+   return out;
+}
+
+// END PARSE JSON RESPONSE
+
+// END PARSE XML RESPONSE
+void HTTPObject::parseXmlBody()
+{
+   tinyxml2::XMLDocument doc;
+   if (doc.Parse((const char*)mBuffer) != tinyxml2::XML_SUCCESS)
+   {
+      Con::errorf("HTTPObject XML parse error");
+      return;
+   }
+
+   const tinyxml2::XMLElement* root = doc.RootElement();
+   if (!root)
+      return;
+
+   mRootValue = convertXmlElement(root);
+   mHasParsedValue = true;
+}
+
+HttpValue HTTPObject::convertXmlElement(const tinyxml2::XMLElement* elem)
+{
+   HttpValue out;
+   out.type = HttpValue::Type::Object;
+
+   // Attributes
+   for (const tinyxml2::XMLAttribute* a = elem->FirstAttribute(); a; a = a->Next())
+   {
+      HttpValue v;
+      v.type = HttpValue::Type::String;
+      v.stringValue = a->Value();
+      out.objectValues["@" + std::string(a->Name())] = v;
+   }
+
+   // Text
+   if (elem->GetText())
+   {
+      HttpValue t;
+      t.type = HttpValue::Type::String;
+      t.stringValue = elem->GetText();
+      out.objectValues["#text"] = t;
+   }
+
+   // Children
+   for (const tinyxml2::XMLElement* c = elem->FirstChildElement(); c; c = c->NextSiblingElement())
+   {
+      HttpValue child = convertXmlElement(c);
+      auto& slot = out.objectValues[c->Name()];
+
+      if (slot.type == HttpValue::Type::Null)
+         slot = std::move(child);
+      else
+      {
+         if (slot.type != HttpValue::Type::Array)
+         {
+            HttpValue arr;
+            arr.type = HttpValue::Type::Array;
+            arr.arrayValues.push_back(slot);
+            slot = std::move(arr);
+         }
+         slot.arrayValues.push_back(child);
+      }
+   }
+
+   return out;
+}
+
+// END PARSE XML RESPONSE
+
+const HttpValue* HTTPObject::resolvePath(const std::string& path) const
+{
+   const HttpValue* current = &mRootValue;
+   size_t pos = 0;
+
+   while (pos < path.size() && current)
+   {
+      size_t dot = path.find('.', pos);
+      std::string token = (dot == std::string::npos) ? path.substr(pos) : path.substr(pos, dot - pos);
+
+      // Handle root or inline arrays: [0]
+      if (!token.empty() && token[0] == '[')
+      {
+         size_t endBracket = token.find(']');
+         if (endBracket == std::string::npos) return nullptr;
+
+         int index = std::stoi(token.substr(1, endBracket - 1));
+         if (current->type != HttpValue::Type::Array) return nullptr;
+         if (index < 0 || index >= (int)current->arrayValues.size()) return nullptr;
+
+         current = &current->arrayValues[index];
+      }
+      else
+      {
+         // Check for key + optional array: items[0]
+         size_t bracket = token.find('[');
+         if (bracket != std::string::npos)
+         {
+            std::string key = token.substr(0, bracket);
+            size_t endBracket = token.find(']', bracket);
+            if (endBracket == std::string::npos) return nullptr;
+
+            int index = std::stoi(token.substr(bracket + 1, endBracket - bracket - 1));
+
+            auto it = current->objectValues.find(key);
+            if (it == current->objectValues.end() || it->second.type != HttpValue::Type::Array)
+               return nullptr;
+
+            if (index < 0 || index >= (int)it->second.arrayValues.size()) return nullptr;
+            current = &it->second.arrayValues[index];
+         }
+         else
+         {
+            auto it = current->objectValues.find(token);
+            if (it == current->objectValues.end()) return nullptr;
+            current = &it->second;
+         }
+      }
+
+      pos = (dot == std::string::npos) ? path.size() : dot + 1;
+   }
+
+   return current;
+}
+
+bool HTTPObject::hasValue(const std::string& path) const
+{
+   return resolvePath(path) != nullptr;
+}
+
+std::string HTTPObject::getString(const std::string& path) const
+{
+   const HttpValue* v = resolvePath(path);
+   if (!v) return "";
+
+   if (v->type == HttpValue::Type::String)
+      return v->stringValue;
+   if (v->type == HttpValue::Type::Number)
+      return std::to_string(v->numberValue);
+   if (v->type == HttpValue::Type::Bool)
+      return v->boolValue ? "true" : "false";
+
+   return ""; // fallback for Object/Array/Null
+}
+
+double HTTPObject::getNumber(const std::string& path) const
+{
+   const HttpValue* v = resolvePath(path);
+   if (!v) return 0.0;
+
+   if (v->type == HttpValue::Type::Number)
+      return v->numberValue;
+   if (v->type == HttpValue::Type::String)
+      return std::stod(v->stringValue); // will throw if not numeric
+   if (v->type == HttpValue::Type::Bool)
+      return v->boolValue ? 1.0 : 0.0;
+
+   return 0.0;
+}
+
+bool HTTPObject::getBool(const std::string& path) const
+{
+   const HttpValue* v = resolvePath(path);
+   if (!v) return false;
+
+   if (v->type == HttpValue::Type::Bool)
+      return v->boolValue;
+   if (v->type == HttpValue::Type::Number)
+      return v->numberValue != 0.0;
+   if (v->type == HttpValue::Type::String)
+      return v->stringValue == "true" || v->stringValue == "1";
+
+   return false;
+}
+
+S32 HTTPObject::getArraySize(const std::string& path) const
+{
+   const HttpValue* v = resolvePath(path);
+   if (!v || v->type != HttpValue::Type::Array)
+      return 0;
+   return static_cast<S32>(v->arrayValues.size());
+}
+
+DefineEngineMethod(HTTPObject, hasValue, bool, (const char* path), ,
+   "@brief Check if a value exists at the given path.\n"
+   "@param path Dot/bracket path into the object (e.g., 'user.name' or 'items[0].id')\n"
+   "@return True if the value exists, false otherwise.")
+{
+   return object->hasValue(path);
+}
+
+DefineEngineMethod(HTTPObject, getString, const char*, (const char* path), ,
+   "@brief Retrieve a string value at the given path.\n"
+   "@param path Dot/bracket path into the object\n"
+   "@return String at that path, or empty string if not found.")
+{
+   const std::string& val = object->getString(path);
+   return StringTable->insert(val.c_str());
+}
+
+DefineEngineMethod(HTTPObject, getNumber, F64, (const char* path), ,
+   "@brief Retrieve a numeric value at the given path.\n"
+   "@param path Dot/bracket path into the object\n"
+   "@return Number at that path, or 0 if not found or not numeric.")
+{
+   return object->getNumber(path);
+}
+
+DefineEngineMethod(HTTPObject, getBool, bool, (const char* path), ,
+   "@brief Retrieve a boolean value at the given path.\n"
+   "@param path Dot/bracket path into the object\n"
+   "@return Boolean at that path, or false if not found.")
+{
+   return object->getBool(path);
+}
+
+DefineEngineMethod(HTTPObject, getArraySize, S32, (const char* path), ,
+   "@brief Get the number of elements in an array at the given path.\n"
+   "@param path Dot/bracket path into the object\n"
+   "@return Number of elements, or 0 if not an array or path invalid.")
+{
+   return object->getArraySize(path);
 }
